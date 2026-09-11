@@ -1,0 +1,33 @@
+{
+  "name": "opencode-goal-plugin",
+  "version": "0.1.0",
+  "description": "Auto-continuing /goal command for OpenCode. Sets a goal, verifies completion with the current LLM on idle, and keeps going until goal_complete is called.",
+  "type": "module",
+  "license": "MIT",
+  "homepage": "https://github.com/modpotato/opencode-goal-plugin",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/modpotato/opencode-goal-plugin.git"
+  },
+  "keywords": ["opencode", "opencode-plugin", "plugin", "goal", "agents"],
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "files": [
+    "src",
+    "goal.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "dependencies": {
+    "@opencode/plugin": "beta",
+    "zod": "^4.1.8",
+    "effect": "4.0.0-beta.59"
+  },
+  "devDependencies": {
+    "typescript": "^5.8.2"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  }
+}

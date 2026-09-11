@@ -69,13 +69,22 @@ While a goal is `active`:
 1. A `context` hook injects `Active /goal: "..."` into the system prompt.
 2. `goal_complete` and `goal_status` end it; `get_goal` reads it;
    `goal_pause` / `goal_resume` pause and resume auto-continuation.
+   `/goal status` (and other display-only outputs like pause/clear/block
+   notices) are posted with `resume: false`, so checking status never
+   starts an LLM run by itself.
 3. On `session.idle`, the plugin asks the session's current model
    (`COMPLETE` / `INCOMPLETE` verdict). `COMPLETE` (or a tool call) ends the
    goal; otherwise it re-prompts `Continue working toward the active goal.`
+   The in-progress guard expires after 60s, so a reload mid-verification
+   can never wedge a session (a stale guard is ignored).
 4. Stops after `maxAttempts` auto-continues (default `0` = unlimited).
 5. On `session.compaction.ended` (V2) a synthetic carry-over message
    re-anchors the goal in the fresh transcript; V1 feeds it into the
    compaction prompt instead.
+6. On `session.created` (V2) a forked child with no stored goal inherits
+   its parent's goal (attempts preserved), since storage is keyed per
+   session and forks get a new ID. A `resume: false` notice records the
+   inheritance in the child transcript.
 
 ## Options
 

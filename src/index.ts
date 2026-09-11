@@ -41,8 +41,24 @@ const DEFAULT_MAX_ATTEMPTS = 0
 const keyFor = (sessionID: string) => `goal:${sessionID}`
 
 // Guard against re-entrant verification loops (module-level so it survives
-// across setup reloads within the same process).
-const verifying = new Set<string>()
+// across setup reloads within the same process). Entries expire so a reload
+// mid-verification can never wedge a session forever (stale entry => ignored).
+const verifying = new Map<string, number>()
+const VERIFY_TTL_MS = 60_000
+
+function isVerifying(sessionID: string): boolean {
+  const at = verifying.get(sessionID)
+  if (at === undefined) return false
+  if (Date.now() - at > VERIFY_TTL_MS) {
+    verifying.delete(sessionID)
+    return false
+  }
+  return true
+}
+
+function markVerifying(sessionID: string) {
+  verifying.set(sessionID, Date.now())
+}
 
 function parseGoalArgs(raw: string): { kind: string; rest: string } {
   const trimmed = (raw ?? "").trim()
@@ -185,6 +201,7 @@ const v2Plugin = Plugin.define({
             if (!goal) return { content: "No active goal to pause. Use /goal <objective> to set one." }
             if (goal.status === "paused") return { content: `Goal is already paused: "${goal.text}"` }
             await setGoal(sessionID, { ...goal, status: "paused", updatedAt: Date.now() })
+            verifying.delete(sessionID)
             return { content: `Goal paused via goal_status: "${goal.text}"` }
           }
           if (args?.status === "active") {
@@ -210,7 +227,8 @@ const v2Plugin = Plugin.define({
               .synthetic({
                 sessionID,
                 text: `Goal marked BLOCKED via goal_status: "${goal.text}"\nReason: ${reason.trim()}`,
-              })
+                resume: false,
+              } as any)
               .catch(() => undefined)
             return { content: `Goal marked blocked via goal_status: "${goal.text}"\nReason: ${reason.trim()}` }
           }
@@ -252,6 +270,7 @@ const v2Plugin = Plugin.define({
           if (!goal) return { content: "No active goal to pause. Use /goal <objective> to set one." }
           if (goal.status === "paused") return { content: `Goal is already paused: "${goal.text}"` }
           await setGoal(sessionID, { ...goal, status: "paused", updatedAt: Date.now() })
+          verifying.delete(sessionID)
           const reason = (input as { reason?: unknown })?.reason
           const suffix = typeof reason === "string" && reason.trim() ? `\nReason: ${reason.trim()}` : ""
           return { content: `Goal paused: "${goal.text}"${suffix}` }
@@ -260,7 +279,7 @@ const v2Plugin = Plugin.define({
 
       editor.add({
         name: "resume",
-        description: "Resume a paused /goal and immediately continue working toward it.",
+        description: "Resume a paused or blocked /goal and immediately continue working toward it.",
         input: {
           type: "object",
           properties: {},
@@ -312,7 +331,8 @@ const v2Plugin = Plugin.define({
             .synthetic({
               sessionID,
               text: `Goal marked BLOCKED: "${goal.text}"\nReason: ${reason.trim()}\nThis needs the outside world to change. Resume with /goal resume (or goal_resume) once unblocked.`,
-            })
+              resume: false,
+            } as any)
             .catch(() => undefined)
           return { content: `Goal marked blocked: "${goal.text}"\nReason: ${reason.trim()}` }
         },
@@ -330,33 +350,38 @@ const v2Plugin = Plugin.define({
           const now = Date.now()
 
           if (kind === "show") {
+            // Display-only: must not admit (resume) the model. Without
+            // `resume: false` the status check itself starts an LLM run.
             await ctx.session.synthetic({
               sessionID,
               text: existing ? formatGoal(existing) : "No active goal. Usage: /goal <objective>",
-            })
+              description: "Goal status",
+              resume: false,
+            } as any)
             return
           }
 
           if (kind === "clear") {
             await setGoal(sessionID, null)
             verifying.delete(sessionID)
-            await ctx.session.synthetic({ sessionID, text: "Goal cleared." })
+            await ctx.session.synthetic({ sessionID, text: "Goal cleared.", resume: false } as any)
             return
           }
 
           if (kind === "pause") {
             if (!existing) {
-              await ctx.session.synthetic({ sessionID, text: "No goal to pause." })
+              await ctx.session.synthetic({ sessionID, text: "No goal to pause.", resume: false } as any)
               return
             }
             await setGoal(sessionID, { ...existing, status: "paused", updatedAt: now })
-            await ctx.session.synthetic({ sessionID, text: `Goal paused: "${existing.text}"` })
+            verifying.delete(sessionID)
+            await ctx.session.synthetic({ sessionID, text: `Goal paused: "${existing.text}"`, resume: false } as any)
             return
           }
 
           if (kind === "resume") {
             if (!existing) {
-              await ctx.session.synthetic({ sessionID, text: "No goal to resume." })
+              await ctx.session.synthetic({ sessionID, text: "No goal to resume.", resume: false } as any)
               return
             }
             const resumed: GoalState = { ...existing, status: "active", updatedAt: now }
@@ -371,11 +396,11 @@ const v2Plugin = Plugin.define({
 
           if (kind === "append") {
             if (!rest) {
-              await ctx.session.synthetic({ sessionID, text: "Usage: /goal append <text>" })
+              await ctx.session.synthetic({ sessionID, text: "Usage: /goal append <text>", resume: false } as any)
               return
             }
             if (!existing) {
-              await ctx.session.synthetic({ sessionID, text: "No goal to append to. Usage: /goal <objective>" })
+              await ctx.session.synthetic({ sessionID, text: "No goal to append to. Usage: /goal <objective>", resume: false } as any)
               return
             }
             const next: GoalState = { ...existing, text: `${existing.text}\n${rest}`, status: "active", updatedAt: now }
@@ -393,11 +418,12 @@ const v2Plugin = Plugin.define({
               await ctx.session.synthetic({
                 sessionID,
                 text: "Usage: /goal block <reason> — the reason is required so the blocker is recorded.",
-              })
+                resume: false,
+              } as any)
               return
             }
             if (!existing) {
-              await ctx.session.synthetic({ sessionID, text: "No goal to block." })
+              await ctx.session.synthetic({ sessionID, text: "No goal to block.", resume: false } as any)
               return
             }
             const blocked: GoalState = { ...existing, status: "blocked", blockedReason: rest, updatedAt: now }
@@ -406,7 +432,8 @@ const v2Plugin = Plugin.define({
             await ctx.session.synthetic({
               sessionID,
               text: `Goal marked BLOCKED: "${existing.text}"\nReason: ${rest}\nResume with /goal resume once the outside world cooperates.`,
-            })
+              resume: false,
+            } as any)
             return
           }
 
@@ -416,7 +443,8 @@ const v2Plugin = Plugin.define({
             await ctx.session.synthetic({
               sessionID,
               text: existing ? `Goal marked complete: "${existing.text}"${rest ? `\n${rest}` : ""}` : "No active goal.",
-            })
+              resume: false,
+            } as any)
             return
           }
 
@@ -425,7 +453,9 @@ const v2Plugin = Plugin.define({
             await ctx.session.synthetic({
               sessionID,
               text: existing ? formatGoal(existing) : "Usage: /goal <objective>",
-            })
+              description: "Goal status",
+              resume: false,
+            } as any)
             return
           }
           const next: GoalState = {
@@ -461,7 +491,7 @@ const v2Plugin = Plugin.define({
     })
 
     const handleIdle = async (sessionID: string) => {
-      if (!sessionID || verifying.has(sessionID)) return
+      if (!sessionID || isVerifying(sessionID)) return
       let goal: GoalState | undefined
       try {
         goal = await getGoal(sessionID)
@@ -471,13 +501,14 @@ const v2Plugin = Plugin.define({
       if (!goal || goal.status !== "active") return
       if (maxAttempts > 0 && goal.attempts >= maxAttempts) {
         await setGoal(sessionID, null).catch(() => undefined)
+        verifying.delete(sessionID)
         await ctx.session
-          .synthetic({ sessionID, text: `Goal stopped after ${goal.attempts} auto-continue attempts (max ${maxAttempts}): "${goal.text}"` })
+          .synthetic({ sessionID, text: `Goal stopped after ${goal.attempts} auto-continue attempts (max ${maxAttempts}): "${goal.text}"`, resume: false } as any)
           .catch(() => undefined)
         return
       }
 
-      verifying.add(sessionID)
+      markVerifying(sessionID)
       try {
         // 1) Verify with the *current* LLM (same model + session context).
         if (verify) {
@@ -488,8 +519,9 @@ const v2Plugin = Plugin.define({
             if (!fresh) return // completed via tool
             if (verdict && isCompleteVerdict((verdict as { text: string }).text ?? "")) {
               await setGoal(sessionID, null).catch(() => undefined)
+              verifying.delete(sessionID)
               await ctx.session
-                .synthetic({ sessionID, text: `Goal verified complete: "${fresh.text}"\n${(verdict as { text: string }).text}` })
+                .synthetic({ sessionID, text: `Goal verified complete: "${fresh.text}"\n${(verdict as { text: string }).text}`, resume: false } as any)
                 .catch(() => undefined)
               return
             }
@@ -511,6 +543,41 @@ const v2Plugin = Plugin.define({
       }
     }
 
+    // Forks get a new sessionID but plugin storage is keyed per session, so a
+    // goal set before forking would silently disappear in the child ("plugin
+    // not working in the fork"). Copy an unedited parent goal into the child.
+    const inheritGoalForFork = async (newID: string, parentID?: string) => {
+      try {
+        const existing = await getGoal(newID).catch(() => undefined)
+        if (existing) return
+        let parent = parentID
+        if (!parent) {
+          try {
+            const info = (await ctx.session.get({ sessionID: newID })) as unknown as {
+              parentID?: string
+              fork?: { sessionID?: string }
+            }
+            parent = info?.parentID ?? info?.fork?.sessionID
+          } catch {
+            return
+          }
+        }
+        if (!parent || parent === newID) return
+        const pg = await getGoal(parent).catch(() => undefined)
+        if (!pg) return
+        await setGoal(newID, { ...pg, updatedAt: Date.now() }).catch(() => undefined)
+        await ctx.session
+          .synthetic({
+            sessionID: newID,
+            text: `Goal inherited from forked session: "${pg.text}" [${pg.status}, attempts: ${pg.attempts}].`,
+            resume: false,
+          } as any)
+          .catch(() => undefined)
+      } catch {
+        // best-effort: never break session creation
+      }
+    }
+
     const carryGoalOverCompaction = async (sessionID: string) => {
       let goal: GoalState | undefined
       try {
@@ -524,7 +591,8 @@ const v2Plugin = Plugin.define({
           .synthetic({
             sessionID,
             text: `Goal still BLOCKED across compaction: "${goal.text}"\nReason: ${goal.blockedReason ?? "(no reason recorded)"}\nWaiting on the outside world; resume with /goal resume (or goal_resume) once unblocked.`,
-          })
+            resume: false,
+          } as any)
           .catch(() => undefined)
         return
       }
@@ -553,6 +621,12 @@ const v2Plugin = Plugin.define({
             if (type === "session.compaction.ended") {
               const sid = (event as unknown as { data?: { sessionID?: string } }).data?.sessionID
               if (sid) void carryGoalOverCompaction(sid)
+              continue
+            }
+            // A forked child starts with no stored goal: inherit the parent's.
+            if (type === "session.created") {
+              const d = (event as unknown as { data?: { sessionID?: string; parentID?: string } }).data
+              if (d?.sessionID) void inheritGoalForFork(d.sessionID, d.parentID)
               continue
             }
             // Hygiene: drop stored goals for deleted sessions (best-effort).
@@ -746,7 +820,7 @@ async function v1Server(ctxV1: any) {
       try {
         if (event?.type === "session.idle") {
           const sessionID = event?.properties?.sessionID
-          if (!sessionID || verifying.has(sessionID)) return
+          if (!sessionID || isVerifying(sessionID)) return
           const goal = goals.get(sessionID)
           if (!goal || goal.status !== "active") return
           if (maxAttempts > 0 && goal.attempts >= maxAttempts) {

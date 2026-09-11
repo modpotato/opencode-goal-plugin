@@ -20,7 +20,7 @@ import { z } from "zod"
  * - Durable per-session state via `ctx.storage` (V2), in-memory + optional file (V1).
  */
 
-type GoalStatus = "active" | "paused"
+type GoalStatus = "active" | "paused" | "blocked"
 
 type GoalState = {
   text: string
@@ -28,6 +28,7 @@ type GoalState = {
   createdAt: number
   updatedAt: number
   attempts: number
+  blockedReason?: string
 }
 
 type PluginOptions = {
@@ -54,13 +55,15 @@ function parseGoalArgs(raw: string): { kind: string; rest: string } {
   if (["pause", "hold"].includes(cmd)) return { kind: "pause", rest }
   if (["resume", "unpause", "continue"].includes(cmd)) return { kind: "resume", rest }
   if (["append", "add"].includes(cmd)) return { kind: "append", rest }
+  if (["block", "blocked", "stuck"].includes(cmd)) return { kind: "block", rest }
   if (["complete", "finish", "achieved"].includes(cmd)) return { kind: "complete", rest }
   // Default: whole raw string is the objective (allows `/goal fix login bug`).
   return { kind: "set", rest: trimmed }
 }
 
 function formatGoal(goal: GoalState): string {
-  return `Goal [${goal.status}] (attempts: ${goal.attempts}): ${goal.text}`
+  const base = `Goal [${goal.status}] (attempts: ${goal.attempts}): ${goal.text}`
+  return goal.status === "blocked" && goal.blockedReason ? `${base}\nBlocked reason: ${goal.blockedReason}` : base
 }
 
 function verifierPrompt(goalText: string): string {
@@ -105,15 +108,22 @@ const v2Plugin = Plugin.define({
       if (typeof g.text !== "string" || !g.text.trim()) return undefined
       return {
         text: g.text,
-        status: g.status === "paused" ? "paused" : "active",
+        status: g.status === "paused" ? "paused" : g.status === "blocked" ? "blocked" : "active",
         createdAt: typeof g.createdAt === "number" ? g.createdAt : Date.now(),
         updatedAt: typeof g.updatedAt === "number" ? g.updatedAt : Date.now(),
         attempts: typeof g.attempts === "number" ? g.attempts : 0,
+        ...(typeof g.blockedReason === "string" && g.blockedReason.trim() ? { blockedReason: g.blockedReason } : {}),
       }
     }
 
-    const setGoal = (sessionID: string, goal: GoalState | null) =>
-      goal ? ctx.storage.set(keyFor(sessionID), goal as any) : ctx.storage.remove(keyFor(sessionID))
+    const setGoal = (sessionID: string, goal: GoalState | null) => {
+      if (!goal) return ctx.storage.remove(keyFor(sessionID))
+      // A reason only makes sense while blocked; drop the key entirely on any
+      // other write so resume/pause/append can never resurrect a stale one.
+      const stored: GoalState = { ...goal }
+      if (stored.status !== "blocked") delete stored.blockedReason
+      return ctx.storage.set(keyFor(sessionID), stored as any)
+    }
 
     // --- tools: goal_complete + goal_status (covers `goal.complete` / `goal.status(complete)`) ---
     await ctx.tool.transform((editor) => {
@@ -149,19 +159,20 @@ const v2Plugin = Plugin.define({
       editor.add({
         name: "status",
         description:
-          'Get the active /goal, or set its status. Call with {"status":"complete"} to finish, {"status":"paused"} to pause, or {"status":"active"} to resume.',
+          'Get the active /goal, or set its status. Call with {"status":"complete"} to finish, {"status":"paused"} to pause, {"status":"blocked","reason":"..."} to block, or {"status":"active"} to resume.',
         input: {
           type: "object",
           properties: {
-            status: { type: "string", enum: ["complete", "active", "paused"], description: 'New goal status. Omit to just read the current goal.' },
+            status: { type: "string", enum: ["complete", "active", "paused", "blocked"], description: 'New goal status. Omit to just read the current goal.' },
             summary: { type: "string", description: "Optional summary when completing." },
+            reason: { type: "string", description: "Required reason when marking blocked." },
           },
           additionalProperties: false,
         },
         options: { namespace: "goal" },
         execute: async (input, toolCtx) => {
           const sessionID = (toolCtx as unknown as { sessionID: string }).sessionID
-          const args = input as { status?: string; summary?: string }
+          const args = input as { status?: string; summary?: string; reason?: string }
           const goal = await getGoal(sessionID)
           if (args?.status === "complete") {
             await setGoal(sessionID, null)
@@ -185,6 +196,23 @@ const v2Plugin = Plugin.define({
               .prompt({ sessionID, text: continuePrompt(resumed.text, prefix) })
               .catch(() => undefined)
             return { content: `Goal resumed via goal_status: "${resumed.text}"` }
+          }
+          if (args?.status === "blocked") {
+            const reason = args?.reason ?? args?.summary
+            if (typeof reason !== "string" || !reason.trim()) {
+              return { content: "A reason is required to mark a goal blocked. What external problem makes it impossible?" }
+            }
+            if (!goal) return { content: "No active goal to block. Use /goal <objective> to set one." }
+            const blocked: GoalState = { ...goal, status: "blocked", blockedReason: reason.trim(), updatedAt: Date.now() }
+            await setGoal(sessionID, blocked)
+            verifying.delete(sessionID)
+            await ctx.session
+              .synthetic({
+                sessionID,
+                text: `Goal marked BLOCKED via goal_status: "${goal.text}"\nReason: ${reason.trim()}`,
+              })
+              .catch(() => undefined)
+            return { content: `Goal marked blocked via goal_status: "${goal.text}"\nReason: ${reason.trim()}` }
           }
           if (!goal) return { content: "No active goal. Use /goal <objective> to set one." }
           return { content: formatGoal(goal) }
@@ -252,13 +280,50 @@ const v2Plugin = Plugin.define({
           return { content: `Goal resumed: "${resumed.text}"` }
         },
       })
+
+      editor.add({
+        name: "blocked",
+        description:
+          'Mark the active /goal as blocked when finishing is impossible due to an external, worldly problem you cannot resolve here (unreachable host, nonexistent machine, missing access). Do NOT use for ordinary difficulty, minor inconveniences, or uncertainty — keep working through those. A reason is required.',
+        input: {
+          type: "object",
+          properties: {
+            reason: { type: "string", description: "What external, unresolvable problem blocks the goal." },
+          },
+          required: ["reason"],
+          additionalProperties: false,
+        },
+        options: { namespace: "goal" },
+        execute: async (input, toolCtx) => {
+          const sessionID = (toolCtx as unknown as { sessionID: string }).sessionID
+          const goal = await getGoal(sessionID)
+          const reason = (input as { reason?: unknown })?.reason
+          if (typeof reason !== "string" || !reason.trim()) {
+            return { content: "A reason is required to mark a goal blocked. What external problem makes it impossible?" }
+          }
+          if (!goal) return { content: "No active goal to block. Use /goal <objective> to set one." }
+          if (goal.status === "blocked") {
+            return { content: `Goal is already blocked: "${goal.text}"\nReason: ${goal.blockedReason ?? reason.trim()}` }
+          }
+          const blocked: GoalState = { ...goal, status: "blocked", blockedReason: reason.trim(), updatedAt: Date.now() }
+          await setGoal(sessionID, blocked)
+          verifying.delete(sessionID)
+          await ctx.session
+            .synthetic({
+              sessionID,
+              text: `Goal marked BLOCKED: "${goal.text}"\nReason: ${reason.trim()}\nThis needs the outside world to change. Resume with /goal resume (or goal_resume) once unblocked.`,
+            })
+            .catch(() => undefined)
+          return { content: `Goal marked blocked: "${goal.text}"\nReason: ${reason.trim()}` }
+        },
+      })
     })
 
     // --- command: /goal ---
     await ctx.command.transform((editor) => {
       editor.add({
         name: "goal",
-        description: "Set an auto-verified goal: /goal <objective> | /goal status | /goal append <text> | /goal pause|resume|clear|complete",
+        description: "Set an auto-verified goal: /goal <objective> | /goal status | /goal append <text> | /goal block <reason> | /goal pause|resume|clear|complete",
         execute: async ({ sessionID, prompt, delivery }) => {
           const { kind, rest } = parseGoalArgs(prompt.text ?? "")
           const existing = await getGoal(sessionID)
@@ -323,6 +388,28 @@ const v2Plugin = Plugin.define({
             return
           }
 
+          if (kind === "block") {
+            if (!rest) {
+              await ctx.session.synthetic({
+                sessionID,
+                text: "Usage: /goal block <reason> — the reason is required so the blocker is recorded.",
+              })
+              return
+            }
+            if (!existing) {
+              await ctx.session.synthetic({ sessionID, text: "No goal to block." })
+              return
+            }
+            const blocked: GoalState = { ...existing, status: "blocked", blockedReason: rest, updatedAt: now }
+            await setGoal(sessionID, blocked)
+            verifying.delete(sessionID)
+            await ctx.session.synthetic({
+              sessionID,
+              text: `Goal marked BLOCKED: "${existing.text}"\nReason: ${rest}\nResume with /goal resume once the outside world cooperates.`,
+            })
+            return
+          }
+
           if (kind === "complete") {
             await setGoal(sessionID, null)
             verifying.delete(sessionID)
@@ -366,7 +453,7 @@ const v2Plugin = Plugin.define({
         if (!goal || goal.status !== "active") return
         event.system.push({
           type: "text",
-          text: `Active /goal: "${goal.text}" (attempt ${goal.attempts}). Keep working until done. When complete, call goal_complete with a summary, or goal_status with {"status":"complete"}. Do not end the turn with questions while the goal is incomplete; use tools and continue.`,
+          text: `Active /goal: "${goal.text}" (attempt ${goal.attempts}). Keep working until done. When complete, call goal_complete with a summary, or goal_status with {"status":"complete"}. If finishing is impossible due to an external problem you cannot resolve (not ordinary difficulty), call goal_blocked with the reason instead of looping. Do not end the turn with questions while the goal is incomplete; use tools and continue.`,
         } as any)
       } catch {
         // Reminder is best-effort; never break the model call.
@@ -431,7 +518,16 @@ const v2Plugin = Plugin.define({
       } catch {
         return
       }
-      if (!goal || goal.status !== "active") return
+      if (!goal || goal.status === "paused") return
+      if (goal.status === "blocked") {
+        await ctx.session
+          .synthetic({
+            sessionID,
+            text: `Goal still BLOCKED across compaction: "${goal.text}"\nReason: ${goal.blockedReason ?? "(no reason recorded)"}\nWaiting on the outside world; resume with /goal resume (or goal_resume) once unblocked.`,
+          })
+          .catch(() => undefined)
+        return
+      }
       await ctx.session
         .synthetic({
           sessionID,
@@ -527,6 +623,12 @@ async function v1Server(ctxV1: any) {
     }
   }
 
+  const activate = (goal: GoalState): GoalState => {
+    const next: GoalState = { ...goal, status: "active", updatedAt: Date.now() }
+    delete next.blockedReason
+    return next
+  }
+
   const completeGoal = (sessionID: string, summary?: string) => {
     const goal = goals.get(sessionID)
     goals.delete(sessionID)
@@ -540,7 +642,7 @@ async function v1Server(ctxV1: any) {
       cfg.command ??= {}
       cfg.command.goal = {
         template: "",
-        description: "Set an auto-verified goal: /goal <objective> | /goal status | /goal clear",
+        description: "Set an auto-verified goal: /goal <objective> | /goal status | /goal block <reason> | /goal clear",
       }
     },
 
@@ -555,10 +657,11 @@ async function v1Server(ctxV1: any) {
         },
       },
       goal_status: {
-        description: 'Get the active /goal, or pass {"status":"complete"|"paused"|"active"} to finish, pause, or resume it.',
+        description: 'Get the active /goal, or pass {"status":"complete"|"paused"|"active"|"blocked"} to finish, pause, resume, or block it.',
         args: {
-          status: z.enum(["complete", "active", "paused"]).optional().describe("New goal status. Omit to just read."),
+          status: z.enum(["complete", "active", "paused", "blocked"]).optional().describe("New goal status. Omit to just read."),
           summary: z.string().optional(),
+          reason: z.string().optional().describe("Required reason when marking blocked."),
         },
         async execute(args: any, context: any) {
           if (args?.status === "complete") return completeGoal(context.sessionID, args?.summary)
@@ -572,10 +675,20 @@ async function v1Server(ctxV1: any) {
           if (args?.status === "active") {
             const goal = goals.get(context.sessionID)
             if (!goal) return "No goal to resume."
-            const resumed: GoalState = { ...goal, status: "active", updatedAt: Date.now() }
+            const resumed = activate(goal)
             goals.set(context.sessionID, resumed)
             void startContinuation(context.sessionID, resumed)
             return `Goal resumed: "${resumed.text}"`
+          }
+          if (args?.status === "blocked") {
+            const reason = args?.reason ?? args?.summary
+            if (typeof reason !== "string" || !reason.trim()) {
+              return "A reason is required to mark a goal blocked. What external problem makes it impossible?"
+            }
+            const goal = goals.get(context.sessionID)
+            if (!goal) return "No active goal to block."
+            goals.set(context.sessionID, { ...goal, status: "blocked", blockedReason: reason.trim(), updatedAt: Date.now() })
+            return `Goal marked blocked: "${goal.text}"\nReason: ${reason.trim()}`
           }
           const goal = goals.get(context.sessionID)
           return goal ? formatGoal(goal) : "No active goal. Use /goal <objective>."
@@ -603,15 +716,28 @@ async function v1Server(ctxV1: any) {
         },
       },
       goal_resume: {
-        description: "Resume a paused /goal and immediately continue working toward it.",
+        description: "Resume a paused or blocked /goal and immediately continue working toward it.",
         args: {},
         async execute(_args: any, context: any) {
           const goal = goals.get(context.sessionID)
           if (!goal) return "No goal to resume."
-          const resumed: GoalState = { ...goal, status: "active", updatedAt: Date.now() }
+          const resumed = activate(goal)
           goals.set(context.sessionID, resumed)
           void startContinuation(context.sessionID, resumed)
           return `Goal resumed: "${resumed.text}"`
+        },
+      },
+      goal_blocked: {
+        description: "Mark the active /goal as blocked when finishing is impossible due to an external, worldly problem you cannot resolve here. Do NOT use for ordinary difficulty. A reason is required.",
+        args: {
+          reason: z.string().min(1).describe("What external, unresolvable problem blocks the goal."),
+        },
+        async execute(args: any, context: any) {
+          const goal = goals.get(context.sessionID)
+          if (!goal) return "No active goal to block."
+          if (goal.status === "blocked") return `Goal is already blocked: "${goal.text}"\nReason: ${goal.blockedReason ?? args?.reason}`
+          goals.set(context.sessionID, { ...goal, status: "blocked", blockedReason: args.reason.trim(), updatedAt: Date.now() })
+          return `Goal marked blocked: "${goal.text}"\nReason: ${args.reason.trim()}`
         },
       },
     },
@@ -649,9 +775,14 @@ async function v1Server(ctxV1: any) {
       try {
         const sessionID = (input as { sessionID?: string })?.sessionID
         const goal = sessionID ? goals.get(sessionID) : undefined
-        if (goal && goal.status === "active" && Array.isArray(output?.context)) {
+        if (!goal || !Array.isArray(output?.context)) return
+        if (goal.status === "active") {
           output.context.push(
             `Active /goal that must survive compaction: "${goal.text}" [status: ${goal.status}, attempts: ${goal.attempts}]. Preserve this goal and the progress toward it in the summary; the session keeps working on it after compaction.`,
+          )
+        } else if (goal.status === "blocked") {
+          output.context.push(
+            `Blocked /goal that must survive compaction: "${goal.text}" [attempts: ${goal.attempts}]. Blocker: ${goal.blockedReason ?? "(no reason recorded)"}. Preserve this goal and its blocker in the summary; it stays blocked until resumed.`,
           )
         }
       } catch {
@@ -692,7 +823,7 @@ async function v1Server(ctxV1: any) {
       }
       if (kind === "resume") {
         if (!existing) return cancel("No goal to resume.")
-        const resumed: GoalState = { ...existing, status: "active", updatedAt: now }
+        const resumed = activate(existing)
         goals.set(sessionID, resumed)
         void startContinuation(sessionID, resumed)
         return cancel(`Goal resumed: "${resumed.text}"`)
@@ -700,10 +831,16 @@ async function v1Server(ctxV1: any) {
       if (kind === "append") {
         if (!rest) return cancel("Usage: /goal append <text>")
         if (!existing) return cancel("No goal to append to.")
-        const next: GoalState = { ...existing, text: `${existing.text}\n${rest}`, status: "active", updatedAt: now }
+        const next = activate({ ...existing, text: `${existing.text}\n${rest}` })
         goals.set(sessionID, next)
         void startContinuation(sessionID, next)
         return cancel(`Goal appended. Continuing: "${next.text}"`)
+      }
+      if (kind === "block") {
+        if (!rest) return cancel("Usage: /goal block <reason> — the reason is required.")
+        if (!existing) return cancel("No goal to block.")
+        goals.set(sessionID, { ...existing, status: "blocked", blockedReason: rest, updatedAt: now })
+        return cancel(`Goal marked BLOCKED: "${existing.text}"\nReason: ${rest}`)
       }
       if (kind === "complete") {
         return cancel(completeGoal(sessionID, rest || undefined))

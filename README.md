@@ -68,7 +68,7 @@ While a goal is `active`:
 3. On `session.idle`, the plugin asks the session's current model
    (`COMPLETE` / `INCOMPLETE` verdict). `COMPLETE` (or a tool call) ends the
    goal; otherwise it re-prompts `Continue working toward the active goal.`
-4. Stops after `maxAttempts` auto-continues (default 15, `0` = unlimited).
+4. Stops after `maxAttempts` auto-continues (default `0` = unlimited).
 5. On `session.compaction.ended` (V2) a synthetic carry-over message
    re-anchors the goal in the fresh transcript; V1 feeds it into the
    compaction prompt instead.
@@ -81,7 +81,7 @@ While a goal is `active`:
     {
       "package": "github:modpotato/opencode-goal-plugin",
       "options": {
-        "maxAttempts": 15,
+        "maxAttempts": 0,
         "verify": true,
         "continuePrefix": "Continue working toward the active goal."
       }
@@ -92,7 +92,7 @@ While a goal is `active`:
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `maxAttempts` | `15` | Max auto-continues per goal before it stops itself (`0` = unlimited). |
+| `maxAttempts` | `0` | Max auto-continues per goal before it stops itself (`0` = unlimited). |
 | `verify` | `true` | Ask the current model whether the goal is complete before continuing. |
 | `continuePrefix` | `"Continue working toward the active goal."` | Prefix of the auto-continue prompt. |
 

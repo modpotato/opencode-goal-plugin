@@ -36,7 +36,7 @@ type PluginOptions = {
   continuePrefix?: string
 }
 
-const DEFAULT_MAX_ATTEMPTS = 15
+const DEFAULT_MAX_ATTEMPTS = 0
 const keyFor = (sessionID: string) => `goal:${sessionID}`
 
 // Guard against re-entrant verification loops (module-level so it survives

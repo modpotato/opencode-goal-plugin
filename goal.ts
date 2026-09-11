@@ -152,11 +152,11 @@ const v2Plugin = Plugin.define({
       editor.add({
         name: "status",
         description:
-          'Get the active /goal, or set its status. To complete via status, call with {"status":"complete"}.',
+          'Get the active /goal, or set its status. Call with {"status":"complete"} to finish, {"status":"paused"} to pause, or {"status":"active"} to resume.',
         input: {
           type: "object",
           properties: {
-            status: { type: "string", enum: ["complete", "active"], description: 'Pass "complete" to finish the goal.' },
+            status: { type: "string", enum: ["complete", "active", "paused"], description: 'New goal status. Omit to just read the current goal.' },
             summary: { type: "string", description: "Optional summary when completing." },
           },
           additionalProperties: false,
@@ -173,8 +173,86 @@ const v2Plugin = Plugin.define({
             if (!goal) return { content: `No active goal was set. Nothing to complete.${suffix}` }
             return { content: `Goal marked complete via goal_status: "${goal.text}"${suffix}` }
           }
+          if (args?.status === "paused") {
+            if (!goal) return { content: "No active goal to pause. Use /goal <objective> to set one." }
+            if (goal.status === "paused") return { content: `Goal is already paused: "${goal.text}"` }
+            await setGoal(sessionID, { ...goal, status: "paused", updatedAt: Date.now() })
+            return { content: `Goal paused via goal_status: "${goal.text}"` }
+          }
+          if (args?.status === "active") {
+            if (!goal) return { content: "No goal to resume. Use /goal <objective> to set one." }
+            const resumed: GoalState = { ...goal, status: "active", updatedAt: Date.now() }
+            await setGoal(sessionID, resumed)
+            verifying.delete(sessionID)
+            await ctx.session
+              .prompt({ sessionID, text: continuePrompt(resumed.text, prefix) })
+              .catch(() => undefined)
+            return { content: `Goal resumed via goal_status: "${resumed.text}"` }
+          }
           if (!goal) return { content: "No active goal. Use /goal <objective> to set one." }
           return { content: formatGoal(goal) }
+        },
+      })
+
+      editor.add({
+        name: "get_goal",
+        description: "Get the active /goal for this session, including its status and auto-continue attempts.",
+        input: {
+          type: "object",
+          properties: {},
+          additionalProperties: false,
+        },
+        execute: async (_input, toolCtx) => {
+          const sessionID = (toolCtx as unknown as { sessionID: string }).sessionID
+          const goal = await getGoal(sessionID)
+          if (!goal) return { content: "No active goal. Use /goal <objective> to set one." }
+          return { content: formatGoal(goal) }
+        },
+      })
+
+      editor.add({
+        name: "pause",
+        description: "Pause the active /goal. Auto-continuation stops until goal_resume is called or /goal resume runs.",
+        input: {
+          type: "object",
+          properties: {
+            reason: { type: "string", description: "Optional reason for pausing." },
+          },
+          additionalProperties: false,
+        },
+        options: { namespace: "goal" },
+        execute: async (input, toolCtx) => {
+          const sessionID = (toolCtx as unknown as { sessionID: string }).sessionID
+          const goal = await getGoal(sessionID)
+          if (!goal) return { content: "No active goal to pause. Use /goal <objective> to set one." }
+          if (goal.status === "paused") return { content: `Goal is already paused: "${goal.text}"` }
+          await setGoal(sessionID, { ...goal, status: "paused", updatedAt: Date.now() })
+          const reason = (input as { reason?: unknown })?.reason
+          const suffix = typeof reason === "string" && reason.trim() ? `\nReason: ${reason.trim()}` : ""
+          return { content: `Goal paused: "${goal.text}"${suffix}` }
+        },
+      })
+
+      editor.add({
+        name: "resume",
+        description: "Resume a paused /goal and immediately continue working toward it.",
+        input: {
+          type: "object",
+          properties: {},
+          additionalProperties: false,
+        },
+        options: { namespace: "goal" },
+        execute: async (_input, toolCtx) => {
+          const sessionID = (toolCtx as unknown as { sessionID: string }).sessionID
+          const goal = await getGoal(sessionID)
+          if (!goal) return { content: "No goal to resume. Use /goal <objective> to set one." }
+          const resumed: GoalState = { ...goal, status: "active", updatedAt: Date.now() }
+          await setGoal(sessionID, resumed)
+          verifying.delete(sessionID)
+          await ctx.session
+            .prompt({ sessionID, text: continuePrompt(resumed.text, prefix) })
+            .catch(() => undefined)
+          return { content: `Goal resumed: "${resumed.text}"` }
         },
       })
     })
@@ -349,6 +427,22 @@ const v2Plugin = Plugin.define({
       }
     }
 
+    const carryGoalOverCompaction = async (sessionID: string) => {
+      let goal: GoalState | undefined
+      try {
+        goal = await getGoal(sessionID)
+      } catch {
+        return
+      }
+      if (!goal || goal.status !== "active") return
+      await ctx.session
+        .synthetic({
+          sessionID,
+          text: `Goal carried over compaction (attempts so far: ${goal.attempts}): "${goal.text}". Keep working toward it; call goal_complete (or goal_status with status "complete") when fully done.`,
+        })
+        .catch(() => undefined)
+    }
+
     // --- turn-end detection: session.idle means the model ended its message ---
     const controller = new AbortController()
     void (async () => {
@@ -359,6 +453,13 @@ const v2Plugin = Plugin.define({
             if (type === "session.idle") {
               const sid = (event as unknown as { data?: { sessionID?: string } }).data?.sessionID
               if (sid) void handleIdle(sid)
+              continue
+            }
+            // After compaction the transcript is summarized: re-anchor the
+            // goal as a synthetic message so it stays in context.
+            if (type === "session.compaction.ended") {
+              const sid = (event as unknown as { data?: { sessionID?: string } }).data?.sessionID
+              if (sid) void carryGoalOverCompaction(sid)
               continue
             }
             // Hygiene: drop stored goals for deleted sessions (best-effort).

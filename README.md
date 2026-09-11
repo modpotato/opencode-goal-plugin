@@ -7,6 +7,12 @@ watches for turn-end (`session.idle`), verifies completion with the **current
 LLM**, and auto-continues until the model calls `goal_complete` (or
 `goal_status` with `{"status": "complete"}`).
 
+Helper tools: `get_goal` (read the active goal), `goal_pause` / `goal_resume`
+(pause and resume auto-continuation; `goal_status` also accepts
+`"paused"` / `"active"`). Goals survive compaction: V2 posts a synthetic
+carry-over message on `session.compaction.ended`, V1 injects the goal into
+the compaction prompt.
+
 Tested on `opencode2` `0.0.0-beta-19425`.
 
 ## Install
@@ -57,11 +63,15 @@ To regenerate `goal.ts` after editing `src/index.ts`, take lines 1–382
 While a goal is `active`:
 
 1. A `context` hook injects `Active /goal: "..."` into the system prompt.
-2. `goal_complete` and `goal_status` tools are available to the model.
+2. `goal_complete` and `goal_status` end it; `get_goal` reads it;
+   `goal_pause` / `goal_resume` pause and resume auto-continuation.
 3. On `session.idle`, the plugin asks the session's current model
    (`COMPLETE` / `INCOMPLETE` verdict). `COMPLETE` (or a tool call) ends the
    goal; otherwise it re-prompts `Continue working toward the active goal.`
 4. Stops after `maxAttempts` auto-continues (default 15, `0` = unlimited).
+5. On `session.compaction.ended` (V2) a synthetic carry-over message
+   re-anchors the goal in the fresh transcript; V1 feeds it into the
+   compaction prompt instead.
 
 ## Options
 
@@ -89,7 +99,7 @@ While a goal is `active`:
 ## How it maps to the opencode way
 
 - Command via `ctx.command.transform` (V2) / `config.command.goal` + `command.execute.before` (V1).
-- Completion via `ctx.tool.transform` namespace `goal` (effective names `goal_complete`, `goal_status`).
+- Completion via `ctx.tool.transform` namespace `goal` (effective names `goal_complete`, `goal_status`, `goal_pause`, `goal_resume`) plus top-level `get_goal`.
 - Turn-end via `session.idle` events (`ctx.event.subscribe` / `event` hook).
 - Durable per-session state via `ctx.storage` (`goal:<sessionID>`), so goals survive compaction and restarts.
 

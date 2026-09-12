@@ -90,6 +90,29 @@ While a goal is `active`:
    session and forks get a new ID. A `resume: false` notice records the
    inheritance in the child transcript.
 
+## Headless / 24-7 usage
+
+`opencode run "/goal <objective>"` does **not** expand the slash command —
+the text reaches the model as a plain prompt, no goal is stored, and the
+plugin's auto-continue never engages (`get_goal` → "No active goal").
+Until headless slash expansion exists, run goals headless with the bundled
+wrapper, which implements goal semantics outside the plugin:
+
+```sh
+GOAL_FILE=goal.txt MODEL=opencode/muse-spark-1.3-contributor-free \
+  ON_BATCH_DONE="my-push-command" \
+  ./headless-goal-loop.sh
+```
+
+- Injects the goal text on every attempt; repeats attempts until the model
+  prints `GOAL_COMPLETE` (so end your goal text with an instruction to do that).
+- Rate-limit signals (`429`, `rate_limit`, `quota`, …) trigger exponential
+  backoff (2m → 30m) and resume instead of dying.
+- `ON_BATCH_DONE` runs after each completed batch (e.g. push to git).
+- Never exits on its own; take a lock so watchdog restarts can't overlap.
+- All knobs (`ATTEMPT_TIMEOUT`, `WORKDIR`, `LOG`, …) are env vars documented
+  at the top of the script.
+
 ## Options
 
 ```jsonc

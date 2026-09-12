@@ -72,11 +72,15 @@ While a goal is `active`:
    `/goal status` (and other display-only outputs like pause/clear/block
    notices) are posted with `resume: false`, so checking status never
    starts an LLM run by itself.
-3. On `session.idle`, the plugin asks the session's current model
-   (`COMPLETE` / `INCOMPLETE` verdict). `COMPLETE` (or a tool call) ends the
-   goal; otherwise it re-prompts `Continue working toward the active goal.`
-   The in-progress guard expires after 60s, so a reload mid-verification
-   can never wedge a session (a stale guard is ignored).
+3. When a run ends (`session.execution.succeeded`; `session.idle` kept as a
+   fallback), the plugin asks the session's current model
+   (`COMPLETE` / `INCOMPLETE` verdict, 120s timeout, failure falls through).
+   `COMPLETE` (or a tool call) ends the goal; otherwise it re-prompts
+   `Continue working toward the active goal.` Failed/interrupted runs do
+   not re-trigger (avoids error spins); `/goal resume` restarts those.
+   The in-progress guard is claimed before the first await (racing triggers
+   can't double-prompt) and stale entries expire after 180s, so a reload
+   mid-verification can never wedge a session.
 4. Stops after `maxAttempts` auto-continues (default `0` = unlimited).
 5. On `session.compaction.ended` (V2) a synthetic carry-over message
    re-anchors the goal in the fresh transcript; V1 feeds it into the

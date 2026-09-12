@@ -19,7 +19,9 @@ const Plugin = { define: (p) => p };
  * - Command via `ctx.command.transform` (V2) / `config.command` + `command.execute.before` (V1).
  * - Completion via `ctx.tool.transform` namespace `goal` (V2) / `tool()` helper shape (V1).
  * - Reminder via `ctx.session.hook("context")` system injection (V2).
- * - Turn-end detection via `session.idle` events (both).
+ * - Turn-end detection via `session.execution.succeeded` (plus `session.idle`
+ *   as a fallback — this server build never emits idle) triggers verify +
+ *   auto-continue.
  * - Durable per-session state via `ctx.storage` (V2), in-memory + optional file (V1).
  */
 
@@ -47,7 +49,12 @@ const keyFor = (sessionID: string) => `goal:${sessionID}`
 // across setup reloads within the same process). Entries expire so a reload
 // mid-verification can never wedge a session forever (stale entry => ignored).
 const verifying = new Map<string, number>()
-const VERIFY_TTL_MS = 60_000
+// Stale threshold must exceed GENERATE_TIMEOUT_MS below: a run that is still
+// verifying (slow model, huge context) must not be treated as stale while a
+// second trigger arrives, but a reload mid-verification must never wedge a
+// session forever.
+const VERIFY_TTL_MS = 180_000
+const GENERATE_TIMEOUT_MS = 120_000
 
 function isVerifying(sessionID: string): boolean {
   const at = verifying.get(sessionID)
@@ -495,41 +502,49 @@ const v2Plugin = Plugin.define({
 
     const handleIdle = async (sessionID: string) => {
       if (!sessionID || isVerifying(sessionID)) return
-      let goal: GoalState | undefined
-      try {
-        goal = await getGoal(sessionID)
-      } catch {
-        return
-      }
-      if (!goal || goal.status !== "active") return
-      if (maxAttempts > 0 && goal.attempts >= maxAttempts) {
-        await setGoal(sessionID, null).catch(() => undefined)
-        verifying.delete(sessionID)
-        await ctx.session
-          .synthetic({ sessionID, text: `Goal stopped after ${goal.attempts} auto-continue attempts (max ${maxAttempts}): "${goal.text}"`, resume: false } as any)
-          .catch(() => undefined)
-        return
-      }
-
+      // Claim the guard FIRST (before any await) so two triggers racing on
+      // the same run (e.g. session.idle + session.execution.succeeded) can't
+      // both verify+prompt. Every path below clears it via finally.
       markVerifying(sessionID)
       try {
+        let goal: GoalState | undefined
+        try {
+          goal = await getGoal(sessionID)
+        } catch {
+          return
+        }
+        if (!goal || goal.status !== "active") return
+        if (maxAttempts > 0 && goal.attempts >= maxAttempts) {
+          await setGoal(sessionID, null).catch(() => undefined)
+          await ctx.session
+            .synthetic({ sessionID, text: `Goal stopped after ${goal.attempts} auto-continue attempts (max ${maxAttempts}): "${goal.text}"`, resume: false } as any)
+            .catch(() => undefined)
+          return
+        }
+
         // 1) Verify with the *current* LLM (same model + session context).
+        // Bounded: verification is best-effort and must never wedge the
+        // drive loop (a hung verifier would stall continuation forever).
         if (verify) {
           try {
-            const verdict = await ctx.session.generate({ sessionID, prompt: verifierPrompt(goal.text) })
+            const verdict = (await Promise.race([
+              ctx.session.generate({ sessionID, prompt: verifierPrompt(goal.text) }),
+              new Promise<never>((_, reject) =>
+                setTimeout(() => reject(new Error("goal verifier timed out")), GENERATE_TIMEOUT_MS),
+              ),
+            ])) as { text: string }
             // Re-read: the model may have called goal_complete during generation-adjacent turns.
             const fresh = await getGoal(sessionID).catch(() => undefined)
             if (!fresh) return // completed via tool
-            if (verdict && isCompleteVerdict((verdict as { text: string }).text ?? "")) {
+            if (verdict && isCompleteVerdict(verdict.text ?? "")) {
               await setGoal(sessionID, null).catch(() => undefined)
-              verifying.delete(sessionID)
               await ctx.session
-                .synthetic({ sessionID, text: `Goal verified complete: "${fresh.text}"\n${(verdict as { text: string }).text}`, resume: false } as any)
+                .synthetic({ sessionID, text: `Goal verified complete: "${fresh.text}"\n${verdict.text}`, resume: false } as any)
                 .catch(() => undefined)
               return
             }
           } catch {
-            // Verifier failure is non-fatal: fall through to auto-continue.
+            // Verifier failure/timeout is non-fatal: fall through to auto-continue.
           }
         }
 
@@ -607,14 +622,20 @@ const v2Plugin = Plugin.define({
         .catch(() => undefined)
     }
 
-    // --- turn-end detection: session.idle means the model ended its message ---
+    // --- turn-end detection ---
+    // NOTE: `session.idle` exists in the protocol but this server build never
+    // emits it (verified via event-tap: runs end with
+    // `session.execution.succeeded` and no idle follows). Drive off the event
+    // that actually fires; keep `session.idle` as a forward-compat fallback.
+    // Deliberately NOT triggering on execution.failed/interrupted: re-prompting
+    // a failing run would spin. The goal stays active; /goal resume restarts it.
     const controller = new AbortController()
     void (async () => {
       try {
         for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
           try {
             const type = (event as { type?: string }).type
-            if (type === "session.idle") {
+            if (type === "session.idle" || type === "session.execution.succeeded") {
               const sid = (event as unknown as { data?: { sessionID?: string } }).data?.sessionID
               if (sid) void handleIdle(sid)
               continue
